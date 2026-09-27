@@ -459,8 +459,7 @@ pub const RenderState = struct {
             if (v > 0) return true;
         }
         if (self.rows != s.pages.rows or
-            self.cols != s.pages.cols
-        ) return true;
+            self.cols != s.pages.cols) return true;
         if (self.viewport_pin) |old| {
             if (!old.eql(s.pages.getTopLeft(.viewport))) return true;
         }
@@ -470,8 +469,7 @@ pub const RenderState = struct {
         // it while every cell stays clean. `beginUpdate` copies the
         // cursor on every call, so after a consumed update these match.
         if (self.cursor.active.x != s.cursor.x or
-            self.cursor.active.y != s.cursor.y
-        ) return true;
+            self.cursor.active.y != s.cursor.y) return true;
 
         // The row walk, without the consuming clears: a page-level dirty
         // flag owes the whole chunk, otherwise the packed row dirty bits

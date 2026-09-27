@@ -1254,6 +1254,17 @@ pub const Surface = struct {
             .y = @floatCast(y_scaled),
         };
 
+        // Forward the scale to the renderer. The DX12 swap chain needs its
+        // inverse as a composition matrix transform: a XAML SwapChainPanel
+        // applies the display scale to the swap chain content itself, and
+        // the content is already at physical resolution, so without the
+        // inverse the surface renders at scale squared. Recorded
+        // atomically here; applied on the renderer thread.
+        self.core_surface.renderer.setContentScale(
+            self.content_scale.x,
+            self.content_scale.y,
+        );
+
         self.core_surface.contentScaleCallback(self.content_scale) catch |err| {
             log.err("error in content scale callback err={}", .{err});
             return;

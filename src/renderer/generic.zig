@@ -1140,6 +1140,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
+        /// Notify the graphics API of the host's DIP-to-pixel ratio. A
+        /// XAML-backed host composites the swap chain content through that
+        /// scale, so a backend that owns the swap chain has to cancel it
+        /// (see DirectX12's applySwapChainScale). Recorded only; the
+        /// backend applies it on its render thread.
+        pub fn setContentScale(self: *Self, x: f32, y: f32) void {
+            if (@hasDecl(GraphicsAPI, "setContentScale")) {
+                self.api.setContentScale(x, y);
+            }
+        }
+
         /// Callback called by renderer.Thread when it begins.
         pub fn threadEnter(self: *Self, surface: *apprt.Surface) !void {
             // If our API has to do things on thread enter, let it.
