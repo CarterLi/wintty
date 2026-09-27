@@ -232,6 +232,30 @@ desired_size: std.atomic.Value(u64) = .init(0),
 applied_width: u32 = 0,
 applied_height: u32 = 0,
 
+/// The host's DIP-to-pixel ratio per axis -- XAML's SwapChainPanel
+/// CompositionScaleX/Y -- updated by setContentScale. Packed into one u64
+/// for the same reason the size is: two atomics would tear during a
+/// monitor move and apply a mixed matrix for a frame. Zero means the apprt
+/// has not told us yet.
+///
+/// The swap chain needs the inverse of this as its composition matrix
+/// transform; see applySwapChainScale.
+desired_scale: std.atomic.Value(u64) = .init(0),
+
+/// The scale the swap chain's matrix transform was last set for. Renderer
+/// thread only, next to applied_width/applied_height.
+applied_scale_x: f32 = 0,
+applied_scale_y: f32 = 0,
+
+/// Set after a SetMatrixTransform failure and cleared by the next
+/// success, so the error logs once instead of every retry.
+matrix_failed: bool = false,
+
+/// The scale the matrix info line was last emitted for. resizeSwapChain
+/// re-arms applied_scale_* on every resize; the log should not follow.
+logged_scale_x: f32 = 0,
+logged_scale_y: f32 = 0,
+
 /// Width in the high 32 bits so a hexdump reads as WWWWWWWW_HHHHHHHH.
 inline fn packSize(width: u32, height: u32) u64 {
     return (@as(u64, width) << 32) | @as(u64, height);
@@ -240,6 +264,17 @@ inline fn unpackSize(packed_size: u64) struct { width: u32, height: u32 } {
     return .{
         .width = @intCast(packed_size >> 32),
         .height = @intCast(packed_size & 0xFFFFFFFF),
+    };
+}
+
+/// Same layout as packSize: x in the high 32 bits, y in the low.
+inline fn packScale(x: f32, y: f32) u64 {
+    return (@as(u64, @as(u32, @bitCast(x))) << 32) | @as(u64, @as(u32, @bitCast(y)));
+}
+inline fn unpackScale(packed_scale: u64) struct { x: f32, y: f32 } {
+    return .{
+        .x = @as(f32, @bitCast(@as(u32, @intCast(packed_scale >> 32)))),
+        .y = @as(f32, @bitCast(@as(u32, @intCast(packed_scale & 0xFFFFFFFF)))),
     };
 }
 
@@ -293,6 +328,12 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !DirectX12 {
     try result.initGpu(surface, init_width, init_height);
     result.desired_size.store(packSize(init_width, init_height), .monotonic);
 
+    // The host's display scale, so the first frame can cancel XAML's own
+    // scaling of the swap chain content (see applySwapChainScale). Set for
+    // every apprt; only SwapChainPanel mode uses it.
+    const content_scale = opts.rt_surface.content_scale;
+    result.setContentScale(content_scale.x, content_scale.y);
+
     return result;
 }
 
@@ -308,6 +349,11 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !DirectX12 {
 /// caller runs `flushInitCommands` once those exist.
 pub fn initGpu(self: *DirectX12, surface: Surface, width: u32, height: u32) !void {
     self.surface = surface;
+    // A freshly built swap chain carries no matrix transform, so whatever
+    // applySwapChainScale last set is gone with the old one. Covers both
+    // init and recoverDevice, the two callers.
+    self.applied_scale_x = 0;
+    self.applied_scale_y = 0;
 
     var dev = device.Device.init(surface, .{
         .width = width,
@@ -987,6 +1033,97 @@ pub fn setTargetSize(self: *DirectX12, width: u32, height: u32) void {
     self.desired_size.store(packSize(width, height), .monotonic);
 }
 
+/// Called by the apprt (via generic.zig) with the host's DIP-to-pixel
+/// ratio, on the same UI thread and under the same rule as setTargetSize:
+/// record only, never touch GPU state. applySwapChainScale does the work
+/// on the renderer thread.
+pub fn setContentScale(self: *DirectX12, x: f32, y: f32) void {
+    // init() seeds the scale from raw config, which bypasses the apprt
+    // clamp in updateContentScale, and +inf would invert to a zero
+    // matrix, so this guard has to stand on its own.
+    if (!(std.math.isFinite(x) and x > 0) or
+        !(std.math.isFinite(y) and y > 0)) return;
+    self.desired_scale.store(packScale(x, y), .monotonic);
+}
+
+/// Set the swap chain's composition matrix transform to the inverse of the
+/// host's display scale.
+///
+/// XAML's SwapChainPanel always applies the display scale to the swap chain
+/// content as it composites it, and the content is already at physical
+/// resolution (the apprt pushes DIP * CompositionScale as the surface
+/// size), so without this the surface lands on screen at scale squared:
+/// only its top-left 1/scale^2 corner is visible, the text is scale times
+/// too large, and pointer coordinates -- which the host sends as DIPs and
+/// libghostty scales to pixels -- resolve to cells scale times further from
+/// the origin than the ones under the cursor. A matrix of 1/scale cancels
+/// XAML's transform and restores a 1:1 mapping onto the panel's physical
+/// pixels. Windows Terminal's AtlasEngine does exactly this in
+/// _updateMatrixTransform.
+///
+/// SwapChainPanel mode only: an HWND surface has no XAML transform above
+/// it, and composition/shared-texture modes have no panel either.
+///
+/// Idempotent -- it returns unless the scale changed -- and cheap enough to
+/// run every frame, which is what covers a ResizeBuffers that drops the
+/// transform. Renderer thread only.
+fn applySwapChainScale(self: *DirectX12) void {
+    const scale = unpackScale(self.desired_scale.load(.monotonic));
+    if (scale.x <= 0 or scale.y <= 0) return;
+    if (scale.x == self.applied_scale_x and scale.y == self.applied_scale_y) return;
+
+    const sc3 = self.swap_chain3 orelse return;
+    switch (self.surface.?) {
+        .swap_chain_panel => {},
+        .hwnd, .composition, .shared_texture => {
+            // Nothing to cancel, but record the scale so the modes that do
+            // not need a matrix stop re-checking the same value every frame.
+            log.info(
+                "no swap chain matrix transform for this surface mode; content scale {d:.2}x{d:.2}",
+                .{ scale.x, scale.y },
+            );
+            self.applied_scale_x = scale.x;
+            self.applied_scale_y = scale.y;
+            return;
+        },
+    }
+
+    const matrix = dxgi.DXGI_MATRIX_3X2_F{
+        ._11 = 1.0 / scale.x,
+        ._12 = 0,
+        ._21 = 0,
+        ._22 = 1.0 / scale.y,
+        ._31 = 0,
+        ._32 = 0,
+    };
+
+    // IDXGISwapChain3 inherits IDXGISwapChain2 in COM, so the v-table
+    // prefix is identical and the reinterpret is safe -- the same idiom
+    // resizeSwapChain uses to reach IDXGISwapChain1.
+    const sc2: *dxgi.IDXGISwapChain2 = @ptrCast(sc3);
+    const hr = sc2.SetMatrixTransform(&matrix);
+    if (com.FAILED(hr)) {
+        // Leave applied_scale_* alone so the next frame retries, but log
+        // once: a persistent failure is otherwise ~120 err lines a second.
+        if (!self.matrix_failed) {
+            self.matrix_failed = true;
+            log.err("SetMatrixTransform failed: 0x{x}", .{@as(u32, @bitCast(hr))});
+        }
+        return;
+    }
+    self.matrix_failed = false;
+
+    self.applied_scale_x = scale.x;
+    self.applied_scale_y = scale.y;
+    if (scale.x == self.logged_scale_x and scale.y == self.logged_scale_y) return;
+    self.logged_scale_x = scale.x;
+    self.logged_scale_y = scale.y;
+    log.info(
+        "swap chain matrix transform {d:.3}x{d:.3} for content scale {d:.2}x{d:.2}",
+        .{ matrix._11, matrix._22, scale.x, scale.y },
+    );
+}
+
 /// Resize the swap chain back buffers in place via IDXGISwapChain1::ResizeBuffers.
 ///
 /// DXGI requires every reference to the existing back buffers (including
@@ -1041,6 +1178,12 @@ fn resizeSwapChain(self: *DirectX12, width: u32, height: u32) !void {
         log.err("ResizeBuffers failed: 0x{x}", .{@as(u32, @bitCast(hr))});
         return error.ResizeBuffersFailed;
     }
+
+    // The ResizeBuffers docs are silent on the composition matrix
+    // transform, so treat it as dropped either way: the beginFrame that
+    // follows re-applies it, and the call is cheap.
+    self.applied_scale_x = 0;
+    self.applied_scale_y = 0;
 
     // Re-acquire back buffers and recreate RTVs at the same descriptor
     // slots. Mirrors the loop in init() so the rtv_handles array stays
@@ -1186,6 +1329,12 @@ pub inline fn beginFrame(
             api.applied_height = want.height;
         }
     }
+
+    // Cancel XAML's display-scale transform on the swap chain content.
+    // Deliberately after the resize block: resizeSwapChain clears
+    // applied_scale_* because ResizeBuffers may drop the transform, and
+    // this is the call that puts it back before this frame's Present.
+    api.applySwapChainScale();
 
     // Determine which frame slot and render target to use.
     // Swap-chain mode rotates through back_buffers[]; shared-texture mode
@@ -1445,6 +1594,58 @@ test "DirectX12 packSize/unpackSize roundtrip" {
     const sz = DirectX12.unpackSize(packed_size);
     try std.testing.expectEqual(@as(u32, 1920), sz.width);
     try std.testing.expectEqual(@as(u32, 1080), sz.height);
+}
+
+test "DirectX12 has desired/applied scale fields" {
+    try std.testing.expect(@hasField(DirectX12, "desired_scale"));
+    try std.testing.expect(@hasField(DirectX12, "applied_scale_x"));
+    try std.testing.expect(@hasField(DirectX12, "applied_scale_y"));
+}
+
+test "DirectX12 has matrix logging latch fields" {
+    try std.testing.expect(@hasField(DirectX12, "matrix_failed"));
+    try std.testing.expect(@hasField(DirectX12, "logged_scale_x"));
+    try std.testing.expect(@hasField(DirectX12, "logged_scale_y"));
+}
+
+test "DirectX12 default scale is zero" {
+    const api: DirectX12 = .{};
+    try std.testing.expectEqual(@as(u64, 0), api.desired_scale.load(.monotonic));
+    try std.testing.expectEqual(@as(f32, 0), api.applied_scale_x);
+    try std.testing.expectEqual(@as(f32, 0), api.applied_scale_y);
+    try std.testing.expect(!api.matrix_failed);
+}
+
+test "DirectX12 packScale/unpackScale roundtrip" {
+    const packed_scale = DirectX12.packScale(1.5, 2.25);
+    const scale = DirectX12.unpackScale(packed_scale);
+    try std.testing.expectEqual(@as(f32, 1.5), scale.x);
+    try std.testing.expectEqual(@as(f32, 2.25), scale.y);
+}
+
+test "DirectX12 unpackScale zero is the not-told-yet sentinel" {
+    const scale = DirectX12.unpackScale(0);
+    try std.testing.expectEqual(@as(f32, 0), scale.x);
+    try std.testing.expectEqual(@as(f32, 0), scale.y);
+}
+
+test "DirectX12 setContentScale rejects non-finite and non-positive" {
+    var api: DirectX12 = .{};
+    api.setContentScale(std.math.inf(f32), 1.0);
+    try std.testing.expectEqual(@as(u64, 0), api.desired_scale.load(.monotonic));
+    api.setContentScale(1.0, std.math.inf(f32));
+    try std.testing.expectEqual(@as(u64, 0), api.desired_scale.load(.monotonic));
+    api.setContentScale(std.math.nan(f32), 1.0);
+    try std.testing.expectEqual(@as(u64, 0), api.desired_scale.load(.monotonic));
+    api.setContentScale(0, 1.0);
+    try std.testing.expectEqual(@as(u64, 0), api.desired_scale.load(.monotonic));
+    api.setContentScale(1.0, -1.0);
+    try std.testing.expectEqual(@as(u64, 0), api.desired_scale.load(.monotonic));
+    // A finite positive pair goes through bit-exact.
+    api.setContentScale(1.5, 2.25);
+    const scale = DirectX12.unpackScale(api.desired_scale.load(.monotonic));
+    try std.testing.expectEqual(@as(f32, 1.5), scale.x);
+    try std.testing.expectEqual(@as(f32, 2.25), scale.y);
 }
 
 test "DirectX12 has device_lost field" {
