@@ -1532,8 +1532,17 @@ public sealed partial class MainWindow : Window
 
         // Surface-targeted window actions raised on the per-window host.
         _host.SizeLimitRequested += (_, lim) => ApplySizeLimit(lim);
-        _host.SetTabTitleRequested += (_, title) =>
-            _tabManager.ActiveTab.UserOverrideTitle = string.IsNullOrWhiteSpace(title) ? null : title;
+        _host.SetTabTitleRequested += (control, title) =>
+        {
+            // The surface names its OWN tab, wherever it lives: a set_tab_title
+            // from a background pane renames that pane's tab, not the selected
+            // one. An empty title still clears. The title is remote text at
+            // the top title tier, so it gets the same refusal the reported
+            // tier gets: a title that is not plain leaves the override
+            // untouched rather than clearing or replacing it.
+            if (TabContaining(control) is not { } tab) return;
+            tab.UserOverrideTitle = string.IsNullOrWhiteSpace(title) ? null : TabLabel.IsPlain(title) ? title : tab.UserOverrideTitle;
+        };
         // The host already raises these on the UI thread (OnAction dispatches
         // before invoking), so no extra hop is needed here. The dialog helper
         // is fire-and-forget and self-contains its exception handling.
@@ -5274,23 +5283,38 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
+    /// The tab whose pane tree holds this surface, or null when no tab here
+    /// does. PresentSurface and the set_tab_title handler both need the same
+    /// answer, so the walk lives once: two copies of it would drift the way
+    /// the title used to, which named the selected tab because the walk was
+    /// missing entirely.
+    /// </summary>
+    private TabModel? TabContaining(Controls.TerminalControl target)
+    {
+        foreach (var tab in _tabManager.Tabs)
+        {
+            var ph = (Panes.PaneHost)tab.PaneHost;
+            foreach (var leaf in PaneTree.Leaves(ph.RootNode))
+            {
+                if (ReferenceEquals(leaf.Terminal(), target)) return tab;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Bring this window to the front and focus the target surface, switching
     /// to its tab if it lives in a background tab (present_terminal).
     /// </summary>
     private void PresentSurface(Controls.TerminalControl target)
     {
         Activate();
-        foreach (var tab in _tabManager.Tabs)
+        if (TabContaining(target) is { } tab)
         {
-            var ph = (Panes.PaneHost)tab.PaneHost;
-            foreach (var leaf in PaneTree.Leaves(ph.RootNode))
-            {
-                if (!ReferenceEquals(leaf.Terminal(), target)) continue;
-                var idx = _tabManager.IndexOf(tab);
-                if (idx >= 0) _tabManager.JumpTo(idx);
-                target.Focus(FocusState.Programmatic);
-                return;
-            }
+            var idx = _tabManager.IndexOf(tab);
+            if (idx >= 0) _tabManager.JumpTo(idx);
+            target.Focus(FocusState.Programmatic);
+            return;
         }
         FocusActiveLeaf();
     }
