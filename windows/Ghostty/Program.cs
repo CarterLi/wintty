@@ -5,7 +5,9 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Ghostty.Core;
 using Ghostty.Core.Config;
+using Ghostty.Core.Logging;
 using Ghostty.Core.SingleInstance;
+using Ghostty.Core.Version;
 using Ghostty.Interop;
 
 namespace Ghostty;
@@ -129,7 +131,7 @@ public static partial class Program
     /// </summary>
     private const uint FILE_APPEND_DATA = 0x00000004;
     private const uint FILE_SHARE_READ = 0x00000001;
-    private const uint CREATE_ALWAYS = 2;
+    private const uint OPEN_ALWAYS = 4;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x80;
 
     private const int ATTACH_PARENT_PROCESS = -1;
@@ -302,20 +304,41 @@ public static partial class Program
     /// persisted to disk.  Called before any native GPU code runs.
     ///
     /// Idempotent: the GUI path and the <see cref="GpuLogEnvVar"/> opt-in can
-    /// both reach it, and re-opening would truncate the log we just wrote.
+    /// both reach it, and re-opening would append a second header block to
+    /// the log we just started.
     /// </summary>
     private static void RedirectStderrToFile()
     {
         if (_stderrRedirected) return;
 
         // Set before the attempt, not after: a redirect that failed once is
-        // not going to succeed on a retry, and reopening would truncate.
+        // not going to succeed on a retry, and reopening would append a
+        // second header block.
         _stderrRedirected = true;
 
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(GpuLogPath)!);
 
+            // Carry the previous launch's log aside before opening. With the
+            // OPEN_ALWAYS open below nothing truncates any more, so without
+            // this move the file would grow across launches forever; with
+            // it, exactly one previous launch survives at gpu.prev.log - the
+            // one support would ask about (#968). Best-effort: a rotation
+            // that fails (the old log held by a tailer) leaves both files in
+            // place, and the open below then appends rather than destroys.
+            GpuLogRotation.Rotate(GpuLogPath);
+
+            // OPEN_ALWAYS, not CREATE_ALWAYS: CREATE_ALWAYS truncated the
+            // log on every launch, so the relaunch a support round-trip asks
+            // for destroyed the previous launch's evidence (#968). After a
+            // successful rotation this creates the file fresh; when the
+            // rotation failed because the stored previous was held
+            // (a tailer), it appends to what is there. When the current log
+            // itself is held by another instance, this open fails outright
+            // and the launch keeps its terminal stderr. Nothing is ever
+            // destroyed. FILE_APPEND_DATA writes at EOF regardless, which
+            // is what the two-writers sharing below rely on.
             // AutoFlush on the writer below pushes every line to the OS, so a
             // GPU driver crash loses at most a partial line. This is not
             // write-through (no FILE_FLAG_WRITE_THROUGH), so the OS cache can
@@ -325,7 +348,7 @@ public static partial class Program
                 FILE_APPEND_DATA,
                 FILE_SHARE_READ,
                 IntPtr.Zero,
-                CREATE_ALWAYS,
+                OPEN_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL,
                 IntPtr.Zero);
 
@@ -380,6 +403,12 @@ public static partial class Program
             WriteStderr(
                 $"=== {AppIdentity.ProductName} GPU log started {DateTime.UtcNow:O} ===");
             WriteStderr($"Log file: {GpuLogPath}");
+            // The identity, so a gpu.log pasted alone answers "what was
+            // running" without a separate +version (#968). Computed once
+            // and cached here, on every path that reaches this file; the
+            // crash entry below reuses the cached value rather than calling
+            // back into libghostty at crash time.
+            WriteStderr(VersionBanner.Header());
         }
         catch
         {
@@ -661,6 +690,15 @@ public static partial class Program
                     $"=== {AppIdentity.ProductName} crash {DateTimeOffset.UtcNow:O} " +
                     $"(pid {Environment.ProcessId}, " +
                     $"managed thread {Environment.CurrentManagedThreadId}) ==={Environment.NewLine}" +
+                    // The identity under the delimiter, for the same reason
+                    // as the gpu.log header (#968): a crash log pasted alone
+                    // has to say what was running. The cache is seeded on
+                    // MainImpl's frame before anything that can crash, and
+                    // ReportFatal/FatalHandler only ever see managed
+                    // exceptions (native crashes belong to sentry), so this
+                    // reads a cached string. A cold call would still only
+                    // ever hit the wrapped constants-only fallback.
+                    $"{VersionBanner.Header()}{Environment.NewLine}" +
                     $"{detail}{Environment.NewLine}{Environment.NewLine}";
 
                 // AppContext.BaseDirectory first, and it stays the default:
@@ -833,6 +871,16 @@ public static partial class Program
         _terminalStderr = Console.Error;
 
         RegisterNativeResolver();
+
+        // Cache the version banner while everything is healthy. ReportFatal
+        // reads this cached string, and its docs promise a crash log on
+        // every managed path - a promise the plain CLI path would break,
+        // because with no WINTTY_GPU_LOG there is no redirect and the crash
+        // entry would have been the first caller: an FFI call into a broken
+        // ghostty.dll at crash time, exactly where the process can least
+        // afford one (#968). On a broken install the read inside throws and
+        // Header() falls back to the constants-only line.
+        VersionBanner.Header();
 
         // `just run-win` launches from the repo root; WinAppSDK self-contained
         // PRI/resource DLLs resolve relative to the process cwd. Pin cwd to
